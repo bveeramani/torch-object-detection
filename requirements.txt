@@ -1,0 +1,3 @@
+pycocotools
+torch
+torchvision
