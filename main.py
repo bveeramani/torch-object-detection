@@ -6,10 +6,11 @@ import warnings
 import torch
 import numpy as np
 import torchvision
+from torchvision import transforms
 
 import ray
 from ray import train
-from ray.air import session
+from ray.air import session, Checkpoint
 from ray.air.util.tensor_extensions.pandas import _create_possibly_ragged_ndarray
 from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
@@ -95,10 +96,16 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 
 
 def preprocess(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    transform = torchvision.transforms.ToTensor()
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ConvertImageDtype(torch.float),
+        ]
+    )
+    # TODO: Use `TorchvisionPreprocessor`
     # FIXME: (_map_block_split pid=36622) ValueError: could not broadcast input array from shape (3,426,640) into shape (3,)
     # batch["image"] = np.array([transform(image).numpy() for image in batch["image"]])
-
     batch["image"] = _create_possibly_ragged_ndarray(
         [transform(image).numpy() for image in batch["image"]]
     )
@@ -167,7 +174,14 @@ def train_one_epoch(*, model, optimizer, scaler, batch_size, epoch):
             optimizer.step()
         optimizer.step()
 
-        session.report({"losses": losses.item(), "epoch": epoch})
+        session.report(
+            {
+                "losses": losses.item(),
+                "epoch": epoch,
+                "lr": optimizer.param_groups[0]["lr"],
+                **{key: value.item() for key, value in loss_dict.items()},
+            }
+        )
 
 
 def train_loop_per_worker(config):
@@ -184,7 +198,20 @@ def train_loop_per_worker(config):
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=config["lr_steps"], gamma=config["lr_gamma"]
     )
-    for epoch in range(0, config["epochs"]):
+    start_epoch = 0
+
+    checkpoint = session.get_checkpoint()
+    if checkpoint is not None:
+        checkpoint_data = checkpoint.to_dict()
+        model.load_state_dict(checkpoint_data["model"])
+        optimizer.load_state_dict(checkpoint_data["optimizer"])
+        lr_scheduler.load_state_dict(checkpoint_data["lr_scheduler"])
+        scaler.load_state_dict(checkpoint_data["scaler"])
+        start_epoch = checkpoint_data["epoch"]
+        if config["amp"]:
+            scaler.load_state_dict(checkpoint_data["scaler"])
+
+    for epoch in range(start_epoch, config["epochs"]):
         train_one_epoch(
             model=model,
             optimizer=optimizer,
@@ -193,13 +220,20 @@ def train_loop_per_worker(config):
             epoch=epoch,
         )
         lr_scheduler.step()
+        checkpoint = Checkpoint.from_dict(
+            {
+                "model": model.module.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "lr_scheduler": lr_scheduler.state_dict(),
+                "scaler": scaler.state_dict() if config["amp"] else None,
+                "config": config,
+                "epoch": epoch,
+            }
+        )
+        session.report({}, checkpoint=checkpoint)
 
 
-# TODO: Add data augmentation
-# TODO: Add checkpoint and restore
-# TODO: Add reporting
 # TODO: Add validation accuracy
-# TODO: Add enable reproducibiltiy?
 trainer = TorchTrainer(
     train_loop_per_worker=train_loop_per_worker,
     train_loop_config={
