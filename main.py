@@ -8,9 +8,13 @@ import numpy as np
 import torchvision
 
 import ray
+from ray import train
+from ray.air import session
 from ray.air.util.tensor_extensions.pandas import _create_possibly_ragged_ndarray
 from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
+from ray.train.torch import TorchTrainer
+from ray.air.config import ScalingConfig
 
 
 def convert_path_to_filename(batch: dict[str, Any]) -> dict[str, Any]:
@@ -94,6 +98,8 @@ def preprocess(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     transform = torchvision.transforms.ToTensor()
     # FIXME: (_map_block_split pid=36622) ValueError: could not broadcast input array from shape (3,426,640) into shape (3,)
     # batch["image"] = np.array([transform(image).numpy() for image in batch["image"]])
+
+    # TODO: Add data augmentation
     batch["image"] = _create_possibly_ragged_ndarray(
         [transform(image).numpy() for image in batch["image"]]
     )
@@ -119,7 +125,7 @@ for image_id in coco.getImgIds():
     filename_to_annotations[filename] = annotations
 
 
-ds = (
+val_dataset = (
     ray.data.read_images(os.path.join(root, "val2017"), mode="RGB", include_paths=True)
     .limit(10)
     .map_batches(convert_path_to_filename, batch_format="numpy")
@@ -129,24 +135,66 @@ ds = (
     .map_batches(add_masks, batch_format="numpy")
     .map_batches(preprocess, batch_format="numpy")
 )
-print(ds)
 
 
-batch = next(iter(ds.iter_batches(batch_size=2, batch_format="numpy")))
-inputs = [torch.as_tensor(image) for image in batch["image"]]
-targets = {
-    "boxes": list(batch["boxes"]),
-    "labels": list(batch["labels"]),
-    "masks": list(batch["masks"]),
-}
-targets = [
-    {
-        "boxes": torch.as_tensor(boxes),
-        "labels": torch.as_tensor(labels),
-        "masks": torch.as_tensor(masks),
-    }
-    for boxes, labels, masks in zip(batch["boxes"], batch["labels"], batch["masks"])
-]
-model = torchvision.models.detection.maskrcnn_resnet50_fpn(
-    weights=torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+def train_one_epoch(model, optimizer, epoch, config):
+    model.train()
+
+    train_dataset_shard = session.get_dataset_shard("train")
+    batches = train_dataset_shard.iter_batches(batch_size=config["batch_size"])
+    for batch in batches:
+        inputs = [torch.as_tensor(image) for image in batch["image"]]
+        targets = [
+            {
+                "boxes": torch.as_tensor(boxes),
+                "labels": torch.as_tensor(labels),
+                "masks": torch.as_tensor(masks),
+            }
+            for boxes, labels, masks in zip(
+                batch["boxes"], batch["labels"], batch["masks"]
+            )
+        ]
+        loss_dict = model(inputs, targets)
+        losses = sum(loss for loss in loss_dict.values())
+
+        session.report({"losses": losses.item(), "epoch": epoch})
+
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+
+
+def train_loop_per_worker(config):
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn()
+    model = train.torch.prepare_model(model)
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(
+        parameters,
+        lr=config["lr"],
+        momentum=config["momentum"],
+        weight_decay=config["weight_decay"],
+    )
+
+    for epoch in range(0, config["epochs"]):
+        train_one_epoch(model, optimizer, epoch, config)
+
+
+# TODO: Add checkpoint and restore
+# TODO: Add learning rate scheduler
+# TODO: Add reporting
+# TODO: Add AMP
+# TODO: Add validation accuracy
+trainer = TorchTrainer(
+    train_loop_per_worker=train_loop_per_worker,
+    train_loop_config={
+        "batch_size": 2,
+        "lr": 0.02,
+        # "epochs": 26,
+        "epochs": 1,
+        "momentum": 0.9,
+        "weight_decay": 1e-4,
+    },
+    scaling_config=ScalingConfig(num_workers=2),
+    datasets={"train": val_dataset},
 )
+results = trainer.fit()
