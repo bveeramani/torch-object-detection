@@ -99,7 +99,6 @@ def preprocess(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     # FIXME: (_map_block_split pid=36622) ValueError: could not broadcast input array from shape (3,426,640) into shape (3,)
     # batch["image"] = np.array([transform(image).numpy() for image in batch["image"]])
 
-    # TODO: Add data augmentation
     batch["image"] = _create_possibly_ragged_ndarray(
         [transform(image).numpy() for image in batch["image"]]
     )
@@ -137,11 +136,11 @@ val_dataset = (
 )
 
 
-def train_one_epoch(model, optimizer, epoch, config):
+def train_one_epoch(*, model, optimizer, scaler, batch_size, epoch):
     model.train()
 
     train_dataset_shard = session.get_dataset_shard("train")
-    batches = train_dataset_shard.iter_batches(batch_size=config["batch_size"])
+    batches = train_dataset_shard.iter_batches(batch_size=batch_size)
     for batch in batches:
         inputs = [torch.as_tensor(image) for image in batch["image"]]
         targets = [
@@ -154,14 +153,21 @@ def train_one_epoch(model, optimizer, epoch, config):
                 batch["boxes"], batch["labels"], batch["masks"]
             )
         ]
-        loss_dict = model(inputs, targets)
-        losses = sum(loss for loss in loss_dict.values())
-
-        session.report({"losses": losses.item(), "epoch": epoch})
+        with torch.cuda.amp.autocast(enabled=scaler is not None):
+            loss_dict = model(inputs, targets)
+            losses = sum(loss for loss in loss_dict.values())
 
         optimizer.zero_grad()
-        losses.backward()
+        if scaler is not None:
+            scaler.scale(losses).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            losses.backward()
+            optimizer.step()
         optimizer.step()
+
+        session.report({"losses": losses.item(), "epoch": epoch})
 
 
 def train_loop_per_worker(config):
@@ -174,16 +180,26 @@ def train_loop_per_worker(config):
         momentum=config["momentum"],
         weight_decay=config["weight_decay"],
     )
-
+    scaler = torch.cuda.amp.GradScaler() if config["amp"] else None
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones=config["lr_steps"], gamma=config["lr_gamma"]
+    )
     for epoch in range(0, config["epochs"]):
-        train_one_epoch(model, optimizer, epoch, config)
+        train_one_epoch(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            batch_size=config["batch_size"],
+            epoch=epoch,
+        )
+        lr_scheduler.step()
 
 
+# TODO: Add data augmentation
 # TODO: Add checkpoint and restore
-# TODO: Add learning rate scheduler
 # TODO: Add reporting
-# TODO: Add AMP
 # TODO: Add validation accuracy
+# TODO: Add enable reproducibiltiy?
 trainer = TorchTrainer(
     train_loop_per_worker=train_loop_per_worker,
     train_loop_config={
@@ -193,6 +209,9 @@ trainer = TorchTrainer(
         "epochs": 1,
         "momentum": 0.9,
         "weight_decay": 1e-4,
+        "amp": False,
+        "lr_steps": [16, 22],
+        "lr_gamma": 0.1,
     },
     scaling_config=ScalingConfig(num_workers=2),
     datasets={"train": val_dataset},
