@@ -1,7 +1,7 @@
 import collections
 import os
 import warnings
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import ray
@@ -9,14 +9,14 @@ import torch
 import torchvision
 from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
-from torchvision import transforms
-
 from ray import train
 from ray.air import Checkpoint, session
 from ray.air.config import ScalingConfig
 from ray.air.util.tensor_extensions.pandas import _create_possibly_ragged_ndarray
 from ray.train.batch_predictor import BatchPredictor
 from ray.train.torch import TorchPredictor, TorchTrainer
+from torchvision import transforms
+from ray.data import ActorPoolStrategy
 
 
 def convert_path_to_filename(batch: dict[str, Any]) -> dict[str, Any]:
@@ -25,52 +25,75 @@ def convert_path_to_filename(batch: dict[str, Any]) -> dict[str, Any]:
     return batch
 
 
-def add_boxes(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    batch["boxes"] = []
+class AddAnnotations:
+    def __init__(self, root: str, split: Literal["train", "val"]):
+        path = os.path.join(root, "annotations", f"instances_{split}2017.json")
+        coco = COCO(path)
 
-    for image, filename in zip(batch["image"], batch["filename"]):
-        annotations = filename_to_annotations[filename]
-        boxes = [annotation["bbox"] for annotation in annotations]
-        boxes = np.stack(boxes)
+        self.filename_to_annotations = {}
+        for image_id in coco.getImgIds():
+            images: list[dict] = coco.loadImgs(image_id)
+            assert len(images) == 1
+            filename = images[0]["file_name"]
 
-        # (X, Y, W, H) -> (X1, Y1, X2, Y2)
-        boxes[:, 2:] += boxes[:, :2]
+            annotation_ids = coco.getAnnIds(imgIds=image_id)
+            if len(annotation_ids) == 0:
+                continue
 
-        height, width = image.shape[0:2]
-        boxes[:, 0::2].clip(min=0, max=width)
-        boxes[:, 1::2].clip(min=0, max=height)
+            annotations = coco.loadAnns(annotation_ids)
+            assert len(annotations) > 0
+            self.filename_to_annotations[filename] = annotations
 
-        batch["boxes"].append(boxes)
+    def __call__(self, batch):
+        batch = self.add_boxes(batch)
+        batch = self.add_labels(batch)
+        batch = self.add_masks(batch)
+        return batch
 
-    batch["boxes"] = np.array(batch["boxes"])
-    return batch
+    def add_boxes(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        batch["boxes"] = []
 
+        for image, filename in zip(batch["image"], batch["filename"]):
+            annotations = self.filename_to_annotations[filename]
+            boxes = [annotation["bbox"] for annotation in annotations]
+            boxes = np.stack(boxes)
 
-def add_labels(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    batch["labels"] = []
+            # (X, Y, W, H) -> (X1, Y1, X2, Y2)
+            boxes[:, 2:] += boxes[:, :2]
 
-    for filename in batch["filename"]:
-        annotations = filename_to_annotations[filename]
-        labels = np.array([annotation["category_id"] for annotation in annotations])
-        batch["labels"].append(labels)
+            height, width = image.shape[0:2]
+            boxes[:, 0::2].clip(min=0, max=width)
+            boxes[:, 1::2].clip(min=0, max=height)
 
-    batch["labels"] = np.array(batch["labels"])
-    return batch
+            batch["boxes"].append(boxes)
 
+        batch["boxes"] = np.array(batch["boxes"])
+        return batch
 
-def add_masks(batch):
-    batch["masks"] = []
+    def add_labels(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        batch["labels"] = []
 
-    for image, filename in zip(batch["image"], batch["filename"]):
-        annotations = filename_to_annotations[filename]
-        segmentations = [annotation["segmentation"] for annotation in annotations]
-        height, width = image.shape[0:2]
-        masks = convert_coco_poly_to_mask(segmentations, height, width)
-        batch["masks"].append(masks)
+        for filename in batch["filename"]:
+            annotations = self.filename_to_annotations[filename]
+            labels = np.array([annotation["category_id"] for annotation in annotations])
+            batch["labels"].append(labels)
 
-    batch["masks"] = np.array(batch["masks"])
+        batch["labels"] = np.array(batch["labels"])
+        return batch
 
-    return batch
+    def add_masks(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        batch["masks"] = []
+
+        for image, filename in zip(batch["image"], batch["filename"]):
+            annotations = self.filename_to_annotations[filename]
+            segmentations = [annotation["segmentation"] for annotation in annotations]
+            height, width = image.shape[0:2]
+            masks = convert_coco_poly_to_mask(segmentations, height, width)
+            batch["masks"].append(masks)
+
+        batch["masks"] = np.array(batch["masks"])
+
+        return batch
 
 
 def convert_coco_poly_to_mask(segmentations, height, width):
@@ -112,32 +135,18 @@ def preprocess(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 
 root = "/Users/balaji/Datasets/COCO/"
-coco = COCO(os.path.join(root, "annotations", "instances_val2017.json"))
-
-filename_to_annotations = {}
-for image_id in coco.getImgIds():
-    images: list[dict] = coco.loadImgs(image_id)
-    assert len(images) == 1
-    filename = images[0]["file_name"]
-
-    annotation_ids = coco.getAnnIds(imgIds=image_id)
-    if len(annotation_ids) == 0:
-        warnings.warn(f"Image with ID {image_id} doesn't have any annotations.")
-        continue
-
-    annotations = coco.loadAnns(annotation_ids)
-    assert len(annotations) > 0
-    filename_to_annotations[filename] = annotations
 
 
 val_dataset = (
     ray.data.read_images(os.path.join(root, "val2017"), mode="RGB", include_paths=True)
     .limit(10)
     .map_batches(convert_path_to_filename, batch_format="numpy")
-    .filter(lambda record: record["filename"] in filename_to_annotations)
-    .map_batches(add_boxes, batch_format="numpy")
-    .map_batches(add_labels, batch_format="numpy")
-    .map_batches(add_masks, batch_format="numpy")
+    # .filter(lambda record: record["filename"] in filename_to_annotations)
+    .map_batches(
+        AddAnnotations(root, split="val"),
+        compute=ActorPoolStrategy(2, 8),
+        batch_format="numpy",
+    )
     .map_batches(preprocess, batch_format="numpy")
 )
 
