@@ -1,22 +1,22 @@
 import collections
-from typing import Any
-import json
 import os
 import warnings
+from typing import Any
 
-import torch
 import numpy as np
-import torchvision
-from torchvision import transforms
-
 import ray
-from ray import train
-from ray.air import session, Checkpoint
-from ray.air.util.tensor_extensions.pandas import _create_possibly_ragged_ndarray
+import torch
+import torchvision
 from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
-from ray.train.torch import TorchTrainer
+from torchvision import transforms
+
+from ray import train
+from ray.air import Checkpoint, session
 from ray.air.config import ScalingConfig
+from ray.air.util.tensor_extensions.pandas import _create_possibly_ragged_ndarray
+from ray.train.batch_predictor import BatchPredictor
+from ray.train.torch import TorchPredictor, TorchTrainer
 
 
 def convert_path_to_filename(batch: dict[str, Any]) -> dict[str, Any]:
@@ -105,8 +105,6 @@ def preprocess(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         ]
     )
     # TODO: Use `TorchvisionPreprocessor`
-    # FIXME: (_map_block_split pid=36622) ValueError: could not broadcast input array from shape (3,426,640) into shape (3,)
-    # batch["image"] = np.array([transform(image).numpy() for image in batch["image"]])
     batch["image"] = _create_possibly_ragged_ndarray(
         [transform(image).numpy() for image in batch["image"]]
     )
@@ -234,7 +232,6 @@ def train_loop_per_worker(config):
         session.report({}, checkpoint=checkpoint)
 
 
-# TODO: Add validation accuracy
 trainer = TorchTrainer(
     train_loop_per_worker=train_loop_per_worker,
     train_loop_config={
@@ -251,23 +248,10 @@ trainer = TorchTrainer(
     scaling_config=ScalingConfig(num_workers=2),
     datasets={"train": val_dataset},
 )
-# results = trainer.fit()
+results = trainer.fit()
 
 
-from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
-
-from ray.train.batch_predictor import BatchPredictor
-from ray.train.torch import TorchPredictor, TorchCheckpoint
-
-model = torchvision.models.detection.maskrcnn_resnet50_fpn(
-    MaskRCNN_ResNet50_FPN_Weights.DEFAULT
-)
-# checkpoint = TorchCheckpoint.from_state_dict(model.state_dict())
-
-
-checkpoint = Checkpoint.from_directory("yeet")
-
-from ray.air.util.tensor_extensions.pandas import _create_possibly_ragged_ndarray
+model = torchvision.models.detection.maskrcnn_resnet50_fpn()
 
 
 class CustomTorchPredictor(TorchPredictor):
@@ -289,7 +273,7 @@ class CustomTorchPredictor(TorchPredictor):
         return predictions
 
 
-predictor = BatchPredictor(checkpoint, CustomTorchPredictor, model=model)
+predictor = BatchPredictor(results.checkpoint, CustomTorchPredictor, model=model)
 predictions = predictor.predict(
     val_dataset,
     feature_columns=["image"],
