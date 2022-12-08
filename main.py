@@ -1,3 +1,4 @@
+import collections
 from typing import Any
 import json
 import os
@@ -250,4 +251,69 @@ trainer = TorchTrainer(
     scaling_config=ScalingConfig(num_workers=2),
     datasets={"train": val_dataset},
 )
-results = trainer.fit()
+# results = trainer.fit()
+
+
+from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
+
+from ray.train.batch_predictor import BatchPredictor
+from ray.train.torch import TorchPredictor, TorchCheckpoint
+
+model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+    MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+)
+# checkpoint = TorchCheckpoint.from_state_dict(model.state_dict())
+
+
+checkpoint = Checkpoint.from_directory("yeet")
+
+from ray.air.util.tensor_extensions.pandas import _create_possibly_ragged_ndarray
+
+
+class CustomTorchPredictor(TorchPredictor):
+    def _predict_numpy(
+        self, data: np.ndarray, dtype: torch.dtype
+    ) -> dict[str, np.ndarray]:
+        inputs = [torch.as_tensor(image) for image in data["image"]]
+        assert all(image.dim() == 3 for image in inputs)
+        outputs = self.call_model(inputs)
+
+        predictions = collections.defaultdict(list)
+        for output in outputs:
+            for key, value in output.items():
+                predictions[key].append(value.cpu().detach().numpy())
+
+        for key, value in predictions.items():
+            predictions[key] = _create_possibly_ragged_ndarray(value)
+        predictions = {"pred_" + key: value for key, value in predictions.items()}
+        return predictions
+
+
+predictor = BatchPredictor(checkpoint, CustomTorchPredictor, model=model)
+predictions = predictor.predict(
+    val_dataset,
+    feature_columns=["image"],
+    keep_columns=["boxes", "labels"],
+    batch_size=4,
+)
+
+
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+
+metric = MeanAveragePrecision()
+for row in predictions.iter_rows():
+    preds = [
+        {
+            "boxes": torch.as_tensor(row["pred_boxes"]),
+            "scores": torch.as_tensor(row["pred_scores"]),
+            "labels": torch.as_tensor(row["pred_labels"]),
+        }
+    ]
+    target = [
+        {
+            "boxes": torch.as_tensor(row["boxes"]),
+            "labels": torch.as_tensor(row["labels"]),
+        }
+    ]
+    metric.update(preds, target)
+print(metric.compute())
