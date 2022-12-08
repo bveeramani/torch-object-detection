@@ -1,12 +1,13 @@
 import collections
 import os
 import warnings
-from typing import Any, Literal
+from typing import Any, Literal, Callable
+from functools import partial
 
 import numpy as np
 import ray
 import torch
-import torchvision
+from torchvision import transforms
 from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
 from ray import train
@@ -45,10 +46,19 @@ class AddAnnotations:
             self.filename_to_annotations[filename] = annotations
 
     def __call__(self, batch):
+        batch = self.filter_missing_annotations(batch)
         batch = self.add_boxes(batch)
         batch = self.add_labels(batch)
         batch = self.add_masks(batch)
         return batch
+
+    def filter_missing_annotations(
+        self, batch: dict[str, np.ndarray]
+    ) -> dict[str, np.ndarray]:
+        keep = [
+            filename in self.filename_to_annotations for filename in batch["filename"]
+        ]
+        return {key: value[keep] for key, value in batch.items()}
 
     def add_boxes(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         batch["boxes"] = []
@@ -119,14 +129,9 @@ def convert_coco_poly_to_mask(segmentations, height, width):
     return masks
 
 
-def preprocess(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ConvertImageDtype(torch.float),
-        ]
-    )
+def preprocess(
+    batch: dict[str, np.ndarray], transform: Callable[[np.ndarray], torch.Tensor]
+) -> dict[str, np.ndarray]:
     # TODO: Use `TorchvisionPreprocessor`
     batch["image"] = _create_possibly_ragged_ndarray(
         [transform(image).numpy() for image in batch["image"]]
@@ -134,21 +139,44 @@ def preprocess(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     return batch
 
 
+def get_dataset(
+    root: str,
+    *,
+    split: Literal["train", "val"],
+    transform: Callable[[np.ndarray], torch.Tensor],
+):
+    return (
+        ray.data.read_images(
+            os.path.join(root, f"{split}2017"), mode="RGB", include_paths=True
+        )
+        .map_batches(convert_path_to_filename, batch_format="numpy")
+        .map_batches(
+            AddAnnotations(root, split=split),
+            compute=ActorPoolStrategy(2, 8),
+            batch_format="numpy",
+        )
+        .map_batches(partial(preprocess, transform=transform), batch_format="numpy")
+    )
+
+
 root = "/Users/balaji/Datasets/COCO/"
 
-
-val_dataset = (
-    ray.data.read_images(os.path.join(root, "val2017"), mode="RGB", include_paths=True)
-    .limit(10)
-    .map_batches(convert_path_to_filename, batch_format="numpy")
-    # .filter(lambda record: record["filename"] in filename_to_annotations)
-    .map_batches(
-        AddAnnotations(root, split="val"),
-        compute=ActorPoolStrategy(2, 8),
-        batch_format="numpy",
-    )
-    .map_batches(preprocess, batch_format="numpy")
+train_transform = transforms.Compose(
+    [
+        transforms.ToTensor(),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ConvertImageDtype(torch.float),
+    ]
 )
+train_dataset = get_dataset(root, split="train", transform=train_transform)
+
+val_transform = transforms.Compose(
+    [
+        transforms.ToTensor(),
+        transforms.ConvertImageDtype(torch.float),
+    ]
+)
+val_dataset = get_dataset(root, split="val", transform=val_transform)
 
 
 def train_one_epoch(*, model, optimizer, scaler, batch_size, epoch):
