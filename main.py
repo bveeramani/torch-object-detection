@@ -1,7 +1,7 @@
 import collections
 import os
 import warnings
-from typing import Any, Literal, Callable
+from typing import Any, Dict, Literal, Callable
 from functools import partial
 
 import numpy as np
@@ -12,15 +12,16 @@ from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
 from ray import train
 from ray.air import Checkpoint, session
-from ray.air.config import ScalingConfig
+from ray.air.config import ScalingConfig, RunConfig
 from ray.air.util.tensor_extensions.pandas import _create_possibly_ragged_ndarray
 from ray.train.batch_predictor import BatchPredictor
+from ray.tune.progress_reporter import CLIReporter
 from ray.train.torch import TorchPredictor, TorchTrainer
-from torchvision import transforms
+from torchvision import transforms, models
 from ray.data import ActorPoolStrategy
 
 
-def convert_path_to_filename(batch: dict[str, Any]) -> dict[str, Any]:
+def convert_path_to_filename(batch: Dict[str, Any]) -> Dict[str, Any]:
     batch["filename"] = np.array([os.path.basename(path) for path in batch["path"]])
     del batch["path"]
     return batch
@@ -53,14 +54,14 @@ class AddAnnotations:
         return batch
 
     def filter_missing_annotations(
-        self, batch: dict[str, np.ndarray]
-    ) -> dict[str, np.ndarray]:
+        self, batch: Dict[str, np.ndarray]
+    ) -> Dict[str, np.ndarray]:
         keep = [
             filename in self.filename_to_annotations for filename in batch["filename"]
         ]
         return {key: value[keep] for key, value in batch.items()}
 
-    def add_boxes(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    def add_boxes(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         batch["boxes"] = []
 
         for image, filename in zip(batch["image"], batch["filename"]):
@@ -80,7 +81,7 @@ class AddAnnotations:
         batch["boxes"] = np.array(batch["boxes"])
         return batch
 
-    def add_labels(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    def add_labels(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         batch["labels"] = []
 
         for filename in batch["filename"]:
@@ -91,7 +92,7 @@ class AddAnnotations:
         batch["labels"] = np.array(batch["labels"])
         return batch
 
-    def add_masks(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    def add_masks(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         batch["masks"] = []
 
         for image, filename in zip(batch["image"], batch["filename"]):
@@ -130,8 +131,8 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 
 
 def preprocess(
-    batch: dict[str, np.ndarray], transform: Callable[[np.ndarray], torch.Tensor]
-) -> dict[str, np.ndarray]:
+    batch: Dict[str, np.ndarray], transform: Callable[[np.ndarray], torch.Tensor]
+) -> Dict[str, np.ndarray]:
     # TODO: Use `TorchvisionPreprocessor`
     batch["image"] = _create_possibly_ragged_ndarray(
         [transform(image).numpy() for image in batch["image"]]
@@ -159,7 +160,7 @@ def get_dataset(
     )
 
 
-root = "/Users/balaji/Datasets/COCO/"
+root = "/mnt/cluster_storage/COCO/"
 
 train_transform = transforms.Compose(
     [
@@ -168,7 +169,7 @@ train_transform = transforms.Compose(
         transforms.ConvertImageDtype(torch.float),
     ]
 )
-train_dataset = get_dataset(root, split="train", transform=train_transform)
+# train_dataset = get_dataset(root, split="train", transform=train_transform)
 
 val_transform = transforms.Compose(
     [
@@ -181,16 +182,24 @@ val_dataset = get_dataset(root, split="val", transform=val_transform)
 
 def train_one_epoch(*, model, optimizer, scaler, batch_size, epoch):
     model.train()
+    
+    lr_scheduler = None
+    if epoch == 0:
+        warmup_factor = 1.0 / 1000
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=warmup_factor, total_iters=1000
+        )
 
+    device = ray.train.torch.get_device()
     train_dataset_shard = session.get_dataset_shard("train")
-    batches = train_dataset_shard.iter_batches(batch_size=batch_size)
+    batches = train_dataset_shard.iter_batches(batch_size=batch_size)    
     for batch in batches:
-        inputs = [torch.as_tensor(image) for image in batch["image"]]
+        inputs = [torch.as_tensor(image).to(device) for image in batch["image"]]
         targets = [
             {
-                "boxes": torch.as_tensor(boxes),
-                "labels": torch.as_tensor(labels),
-                "masks": torch.as_tensor(masks),
+                "boxes": torch.as_tensor(boxes).to(device),
+                "labels": torch.as_tensor(labels).to(device),
+                "masks": torch.as_tensor(masks).to(device),
             }
             for boxes, labels, masks in zip(
                 batch["boxes"], batch["labels"], batch["masks"]
@@ -208,8 +217,11 @@ def train_one_epoch(*, model, optimizer, scaler, batch_size, epoch):
         else:
             losses.backward()
             optimizer.step()
-        optimizer.step()
 
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        print(losses.item(), {key: value.item() for key, value in loss_dict.items()})
         session.report(
             {
                 "losses": losses.item(),
@@ -221,7 +233,7 @@ def train_one_epoch(*, model, optimizer, scaler, batch_size, epoch):
 
 
 def train_loop_per_worker(config):
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn()
+    model = models.detection.maskrcnn_resnet50_fpn(num_classes=91)
     model = train.torch.prepare_model(model)
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(
@@ -282,19 +294,20 @@ trainer = TorchTrainer(
         "lr_steps": [16, 22],
         "lr_gamma": 0.1,
     },
-    scaling_config=ScalingConfig(num_workers=2),
+    scaling_config=ScalingConfig(num_workers=2, use_gpu=True),
+    # run_config=RunConfig(progress_reporter=CLIReporter)  TODO
     datasets={"train": val_dataset},
 )
 results = trainer.fit()
 
 
-model = torchvision.models.detection.maskrcnn_resnet50_fpn()
+model = models.detection.maskrcnn_resnet50_fpn()
 
 
 class CustomTorchPredictor(TorchPredictor):
     def _predict_numpy(
         self, data: np.ndarray, dtype: torch.dtype
-    ) -> dict[str, np.ndarray]:
+    ) -> Dict[str, np.ndarray]:
         inputs = [torch.as_tensor(image) for image in data["image"]]
         assert all(image.dim() == 3 for image in inputs)
         outputs = self.call_model(inputs)
