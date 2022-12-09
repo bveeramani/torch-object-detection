@@ -1,18 +1,19 @@
 import collections
 from functools import partial
-from typing import Callable, Dict, Literal, Tuple
+from typing import Callable, Dict, Literal, Tuple, List
 
 import numpy as np
-import ray
-import torch
 from PIL import Image
+import torch
+from torchvision import datasets, models, transforms
+
+import ray
 from ray import train
-from ray.air import Checkpoint, session
+from ray.air import session
 from ray.air.config import ScalingConfig
 from ray.air.util.tensor_extensions.pandas import _create_possibly_ragged_ndarray
 from ray.train.batch_predictor import BatchPredictor
-from ray.train.torch import TorchPredictor, TorchTrainer
-from torchvision import datasets, models, transforms
+from ray.train.torch import TorchPredictor, TorchTrainer, TorchCheckpoint
 
 name_to_label = {
     "aeroplane": 1,
@@ -38,7 +39,7 @@ name_to_label = {
 }
 
 
-def wrangle_data(batch: Tuple[Image.Image, Dict]) -> Dict[str, np.ndarray]:
+def wrangle_data(batch: List[Tuple[Image.Image, Dict]]) -> Dict[str, np.ndarray]:
     output = collections.defaultdict(list)
     for image, target in batch:
         output["image"].append(np.array(image))
@@ -105,6 +106,12 @@ val_transform = transforms.Compose(
 val_dataset = get_dataset("data", split="val", transform=val_transform)
 
 
+# TODO: (_map_block_split pid=46959) /Users/balaji/Documents/detection/third_party/ray/python/ray/air/util/tensor_extensions/pandas.py:1438: VisibleDeprecationWarning: Creating an ndarray from ragged nested sequences (which is a list-or-tuple of lists-or-tuples-or ndarrays with different lengths or shapes) is deprecated. If you meant to do this, you must specify 'dtype=object' when creating the ndarray.
+# TODO: Raise `NotImplementedError` if string ragged tensor
+# TODO: Update docs with limitation and supported types
+# FIXME: pyarrow.lib.ArrowInvalid: Unable to merge: Field boxes has incompatible types: extension<arrow.py_extension_type<ArrowVariableShapedTensorType>> vs extension<arrow.py_extension_type<ArrowTensorType>>
+
+
 def train_one_epoch(*, model, optimizer, batch_size, epoch):
     model.train()
 
@@ -117,20 +124,19 @@ def train_one_epoch(*, model, optimizer, batch_size, epoch):
 
     device = ray.train.torch.get_device()
     train_dataset_shard = session.get_dataset_shard("train")
-    batches = train_dataset_shard.iter_batches(batch_size=batch_size)
+    batches = train_dataset_shard.iter_batches(
+        batch_size=batch_size, batch_format="numpy"
+    )
     for batch in batches:
-        inputs = [torch.as_tensor(image).to(device) for image in batch["image"]]
+        images = [torch.as_tensor(image).to(device) for image in batch["image"]]
         targets = [
             {
                 "boxes": torch.as_tensor(boxes).to(device),
                 "labels": torch.as_tensor(labels).to(device),
-                "masks": torch.as_tensor(masks).to(device),
             }
-            for boxes, labels, masks in zip(
-                batch["boxes"], batch["labels"], batch["masks"]
-            )
+            for boxes, labels in zip(batch["boxes"], batch["labels"])
         ]
-        loss_dict = model(inputs, targets)
+        loss_dict = model(images, targets)
         losses = sum(loss for loss in loss_dict.values())
 
         optimizer.zero_grad()
@@ -153,6 +159,7 @@ def train_one_epoch(*, model, optimizer, batch_size, epoch):
 def train_loop_per_worker(config):
     model = models.detection.fasterrcnn_resnet50_fpn()
     model = train.torch.prepare_model(model)
+
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(
         parameters,
@@ -160,21 +167,12 @@ def train_loop_per_worker(config):
         momentum=config["momentum"],
         weight_decay=config["weight_decay"],
     )
-    scaler = torch.cuda.amp.GradScaler() if config["amp"] else None
+
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=config["lr_steps"], gamma=config["lr_gamma"]
     )
-    start_epoch = 0
 
-    checkpoint = session.get_checkpoint()
-    if checkpoint is not None:
-        checkpoint_data = checkpoint.to_dict()
-        model.load_state_dict(checkpoint_data["model"])
-        optimizer.load_state_dict(checkpoint_data["optimizer"])
-        lr_scheduler.load_state_dict(checkpoint_data["lr_scheduler"])
-        start_epoch = checkpoint_data["epoch"]
-
-    for epoch in range(start_epoch, config["epochs"]):
+    for epoch in range(config["epochs"]):
         train_one_epoch(
             model=model,
             optimizer=optimizer,
@@ -182,15 +180,7 @@ def train_loop_per_worker(config):
             epoch=epoch,
         )
         lr_scheduler.step()
-        checkpoint = Checkpoint.from_dict(
-            {
-                "model": model.module.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "lr_scheduler": lr_scheduler.state_dict(),
-                "config": config,
-                "epoch": epoch,
-            }
-        )
+        checkpoint = TorchCheckpoint.from_state_dict(model.module.state_dict())
         session.report({}, checkpoint=checkpoint)
 
 
@@ -206,20 +196,22 @@ trainer = TorchTrainer(
         "lr_steps": [16, 22],
         "lr_gamma": 0.1,
     },
-    scaling_config=ScalingConfig(num_workers=8, use_gpu=True),
-    datasets={"train": train_dataset},
+    scaling_config=ScalingConfig(num_workers=4, use_gpu=False),
+    datasets={"train": train_dataset.limit(32)},
 )
-results = trainer.fit()
+# results = trainer.fit()
 
 
 model = models.detection.fasterrcnn_resnet50_fpn()
+# checkpoint = results.checkpoint
+checkpoint = TorchCheckpoint.from_state_dict(model.state_dict())
 
 
 class CustomTorchPredictor(TorchPredictor):
     def _predict_numpy(
         self, data: np.ndarray, dtype: torch.dtype
     ) -> Dict[str, np.ndarray]:
-        device = torch.device("cuda")
+        device = torch.device("cuda") if self.use_gpu else torch.device("cpu")
         inputs = [
             torch.as_tensor(image, dtype=dtype, device=device)
             for image in data["image"]
@@ -240,12 +232,11 @@ class CustomTorchPredictor(TorchPredictor):
         return predictions
 
 
-predictor = BatchPredictor(results.checkpoint, CustomTorchPredictor, model=model)
+predictor = BatchPredictor(checkpoint, CustomTorchPredictor, model=model)
 predictions = predictor.predict(
-    val_dataset,
+    val_dataset.limit(32),
     feature_columns=["image"],
     keep_columns=["boxes", "labels"],
-    batch_size=4,
 )
 
 
