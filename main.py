@@ -146,18 +146,19 @@ def get_dataset(
     split: Literal["train", "val"],
     transform: Callable[[np.ndarray], torch.Tensor],
 ):
-    return (
-        ray.data.read_images(
-            os.path.join(root, f"{split}2017"), mode="RGB", include_paths=True
-        )
-        .map_batches(convert_path_to_filename, batch_format="numpy")
-        .map_batches(
-            AddAnnotations(root, split=split),
+    ds = ray.data.read_images(
+        os.path.join(root, f"{split}2017"), mode="RGB", include_paths=True
+    )
+    ds = ds.map_batches(convert_path_to_filename, batch_format="numpy")
+    ds = ds.map_batches(
+            AddAnnotations,
+            fn_constructor_args=[root],
+            fn_constructor_kwargs={"split": split},
             compute=ActorPoolStrategy(2, 8),
             batch_format="numpy",
         )
-        .map_batches(partial(preprocess, transform=transform), batch_format="numpy")
-    )
+    ds = ds.map_batches(partial(preprocess, transform=transform), batch_format="numpy")
+    return ds
 
 
 root = "/mnt/cluster_storage/COCO/"
@@ -169,7 +170,7 @@ train_transform = transforms.Compose(
         transforms.ConvertImageDtype(torch.float),
     ]
 )
-# train_dataset = get_dataset(root, split="train", transform=train_transform)
+train_dataset = get_dataset(root, split="train", transform=train_transform)
 
 val_transform = transforms.Compose(
     [
@@ -192,6 +193,10 @@ def train_one_epoch(*, model, optimizer, scaler, batch_size, epoch):
 
     device = ray.train.torch.get_device()
     train_dataset_shard = session.get_dataset_shard("train")
+
+    num_samples = train_dataset_shard.count()
+    num_samples_seen = 0
+
     batches = train_dataset_shard.iter_batches(batch_size=batch_size)    
     for batch in batches:
         inputs = [torch.as_tensor(image).to(device) for image in batch["image"]]
@@ -221,11 +226,11 @@ def train_one_epoch(*, model, optimizer, scaler, batch_size, epoch):
         if lr_scheduler is not None:
             lr_scheduler.step()
 
-        print(losses.item(), {key: value.item() for key, value in loss_dict.items()})
         session.report(
             {
                 "losses": losses.item(),
                 "epoch": epoch,
+                "progress": num_samples_seen / num_samples, 
                 "lr": optimizer.param_groups[0]["lr"],
                 **{key: value.item() for key, value in loss_dict.items()},
             }
@@ -290,13 +295,13 @@ trainer = TorchTrainer(
         "epochs": 1,
         "momentum": 0.9,
         "weight_decay": 1e-4,
-        "amp": False,
+        "amp": True,
         "lr_steps": [16, 22],
         "lr_gamma": 0.1,
     },
-    scaling_config=ScalingConfig(num_workers=2, use_gpu=True),
+    scaling_config=ScalingConfig(num_workers=8, use_gpu=True),
     # run_config=RunConfig(progress_reporter=CLIReporter)  TODO
-    datasets={"train": val_dataset},
+    datasets={"train": train_dataset.limit(100)},
 )
 results = trainer.fit()
 
